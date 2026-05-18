@@ -1,4 +1,4 @@
-import pymem, pymem.process, pymem.exception
+import pymem, pymem.process, pymem.exception, pymem.pattern
 import tkinter as tk
 from tkinter import font
 import keyboard, psutil, threading, time, struct
@@ -13,7 +13,7 @@ POINTER_CHAINS = {
     "普通资源": (0x00BE40A4, [0x4, 0x20C, 0x7C, 0x40, 0x88, 0x100]),
     "稀有资源": (0x00BE40A4, [0x4, 0xC, 0x178]),
     "感染度":   (0x00BB80D8, [0x1C, 0x864]),
-    # 饱食度由星链动态盲搜引擎接管
+    # ⭐ 饱食度已被删除，全权交由星链动态盲搜引擎接管
 }
 NUM_PLAYERS        = 5
 SCAN_INTERVAL      = 0.05
@@ -24,11 +24,12 @@ ADDR_CACHE_TTL     = 20
 REFUND_WINDOW_SEC  = 300
 DEFAULT_FOOD       = 65   # 空槽位的默认饱食度（用于活跃检测）
 
+# 反查触发阈值（连续失败次数；20Hz 下 30 ≈ 1.5 秒）
 DISCOVER_FAIL_THRESHOLD = 30
 
 
 # ==============================================================
-# 📊 资源追踪器
+# 📊 资源追踪器（纯检测，无硬编码槽位）
 # ==============================================================
 class ResourceTracker:
     def __init__(self, n=NUM_PLAYERS):
@@ -41,10 +42,13 @@ class ResourceTracker:
         self._refund_n  = [[] for _ in range(n)]
         self._refund_r  = [[] for _ in range(n)]
 
+        # ⭐ 完全无硬编码 - 全部由饱食度检测填充
         self.active_slots   = set()
-        self._sorted_active = []
+        self._sorted_active = []   # 缓存排序结果，避免重复 sort
 
     def mark_food(self, slot_idx: int, food):
+        """饱食度偏离默认值且在合法存活区间才标记为活跃；一旦活跃永久保留"""
+        # ⚠️ 防御：拦截 16 万的乱码或负数，防止幽灵槽位激活
         if food is None or food <= 0 or food > 500 or food == DEFAULT_FOOD:
             return
         with self._lock:
@@ -53,6 +57,7 @@ class ResourceTracker:
                 self._sorted_active = sorted(self.active_slots)
 
     def slot_to_res_idx(self, slot_idx: int):
+        """槽位 → 密集资源数组索引；非活跃返回 None"""
         with self._lock:
             try:
                 return self._sorted_active.index(slot_idx)
@@ -176,16 +181,19 @@ class War3StatsApp:
 
         self._addr_cache   = None
         self._cache_countdown = 0
-        self._food_offset_from_inf = None
+        self._food_offset_from_inf = None # ⭐ 星链计划：动态记录物理距离
 
-        self.player_blocks      = {}
+        # ⭐ 自动反查相关
+        self.player_blocks      = {}    # {slot: normal_resource_addr}
         self._discover_running  = False
         self._slot_fail_count   = [0] * NUM_PLAYERS
-        self._discover_attempts = 0
-        self._discover_failed   = False
+        self._discover_attempts = 0      # 总尝试次数，避免无限重试
+        self._discover_failed   = False  # 标记反查已失败（避免反复尝试）
+        # ⭐ 卡死检测
         self._resource_stable_count = [0] * NUM_PLAYERS
         self._prev_resource = [None] * NUM_PLAYERS
         self._initial_discovered = False
+        # ⭐ 记录上次反查时的活跃集合（活跃变大就重查）
         self._last_discover_active = None
 
         self.init_ui()
@@ -344,7 +352,7 @@ class War3StatsApp:
         self.root.after(UI_REFRESH_MS, self._ui_tick)
 
     def _scanner(self):
-        OFFSET_RES_PLAYER = 0x1280
+        OFFSET_RES_PLAYER = 0x1280   # 仅作 1-2 人时的第一跳，多人靠连续行走
         OFFSET_RES_RARE   = 0x80
         OFFSET_ARRAY      = 0x4
 
@@ -364,30 +372,39 @@ class War3StatsApp:
 
                 p1_f = None
                 if p1_inf:
+                    # ==========================================
+                    # 🛰️ 智能锚点定位：以感染度为基石锁定饱食度
+                    # ==========================================
                     if self._food_offset_from_inf is None:
+                        # 方案 A：测试首选固定距离 0x0E50 (应对最新版地图)
                         try:
-                            test_f = self.pm.read_int(p1_inf + 0x0E78)
+                            test_f = self.pm.read_int(p1_inf + 0x0E50)
                             if 0 <= test_f <= 200:
-                                self._food_offset_from_inf = 0x0E78
-                                print("[星链] 祖传偏移 0x0E78 命中！")
+                                self._food_offset_from_inf = 0x0E50
+                                print("[星链] 祖传偏移 0x0E50 命中！")
                         except Exception:
                             pass
 
+                        # 方案 B：如果首选失败，触发开局全员 65 盲搜协议
                         if self._food_offset_from_inf is None:
                             try:
                                 print("[星链] 启动 65 盲搜特征定位...")
-                                win = self.pm.read_bytes(p1_inf - 0x2000, 0x4000)
+                                # 将搜索半径扩大 4 倍，扫描前后 32KB (0x8000) 范围
+                                search_radius = 0x8000
+                                win = self.pm.read_bytes(p1_inf - search_radius, search_radius * 2)
                                 target_sig = struct.pack('<5I', 65, 65, 65, 65, 65)
                                 idx = win.find(target_sig)
                                 if idx != -1:
-                                    self._food_offset_from_inf = idx - 0x2000
+                                    self._food_offset_from_inf = idx - search_radius
                                     print(f"[星链] 盲搜成功！新距离锁定为: "
                                           f"{hex(self._food_offset_from_inf)}")
                             except Exception:
                                 pass
 
+                    # 只要锁定了距离，秒算出饱食度地址
                     if self._food_offset_from_inf is not None:
                         p1_f = p1_inf + self._food_offset_from_inf
+                    # ==========================================
 
                 if any((p1_n, p1_inf, p1_f)):
                     self._addr_cache = (p1_n, p1_inf, p1_f)
@@ -399,6 +416,7 @@ class War3StatsApp:
             else:
                 p1_n, p1_inf, p1_f = self._addr_cache
 
+            # 阶段1：饱食度/感染度（按槽位索引）
             food_arr = [None] * NUM_PLAYERS
             inf_arr  = [None] * NUM_PLAYERS
             for i in range(NUM_PLAYERS):
@@ -417,10 +435,12 @@ class War3StatsApp:
                     except Exception:
                         self._addr_cache = None
 
+            # 阶段2：资源（优先反查地址，回退到第一跳 stride）
             for i in range(NUM_PLAYERS):
                 normal = rare = None
                 used_discovered = False
 
+                # ⭐ 优先使用反查得到的精确地址
                 if i in self.player_blocks:
                     try:
                         n_addr = self.player_blocks[i]
@@ -437,6 +457,7 @@ class War3StatsApp:
                     except Exception:
                         self.player_blocks.pop(i, None)
 
+                # 回退：仅第一跳 stride（dense[0]/dense[1] 可靠）
                 if not used_discovered and p1_n:
                     res_idx = self.tracker.slot_to_res_idx(i)
                     if res_idx is not None and res_idx <= 1:
@@ -455,6 +476,7 @@ class War3StatsApp:
                             normal = rare = None
                             self._addr_cache = None
 
+                # ⭐ 卡死检测：活跃槽位读到的值死活不变 → 算失败
                 if (i in self.tracker.active_slots
                     and i not in self.player_blocks
                     and normal is not None):
@@ -467,6 +489,7 @@ class War3StatsApp:
                 else:
                     self._resource_stable_count[i] = 0
 
+                # 累计失败次数（None 或卡死都算）
                 if (i in self.tracker.active_slots
                     and i not in self.player_blocks
                     and (normal is None
@@ -488,11 +511,13 @@ class War3StatsApp:
                         is_active=(i in self.tracker.active_slots),
                     )
 
+            # ⭐ 触发反查：活跃集合变大 或 失败累计
             if not self._discover_running:
                 cur_active = frozenset(self.tracker.active_slots)
                 missing = [s for s in cur_active
                            if s not in self.player_blocks]
 
+                # 活跃集合发生变化 → 解除失败锁，允许重新反查
                 if cur_active != self._last_discover_active:
                     self._discover_failed = False
                     self._discover_attempts = 0
@@ -513,6 +538,7 @@ class War3StatsApp:
                     threading.Thread(target=self._do_auto_discover,
                                      daemon=True).start()
 
+    # ── 自动反查（后台线程）─────────────────────────────────
     def _do_auto_discover(self):
         try:
             self._discover_attempts += 1
@@ -538,7 +564,11 @@ class War3StatsApp:
             self._discover_running = False
 
     def discover_player_blocks(self):
-        """连续行走 + DNA 签名（步长无关）"""
+        """
+        ⭐ 连续行走 + DNA 签名（步长无关）。
+        关键发现：玩家块连续但大小可变(0x1280/0x1290)，固定步长必累积误差。
+        从 dense[0] 出发，用结构签名逐块"走"到下一块，自适应任意步长。
+        """
         if not self.pm or not self._addr_cache:
             return None
         p1_n, p1_inf, p1_f = self._addr_cache
@@ -550,7 +580,7 @@ class War3StatsApp:
         if n_active == 0:
             return None
 
-        BLOCK0 = 0x1280
+        BLOCK0 = 0x1280            # 第一段步长（已确认可靠）
         dense0 = p1_n
         dense1 = p1_n + BLOCK0
 
@@ -559,6 +589,7 @@ class War3StatsApp:
         if n_active == 2:
             return {active[0]: dense0, active[1]: dense1}
 
+        # ── 提取 DNA：两个已知块都相同的非零 4 字节 ──────────
         try:
             blk0 = self.pm.read_bytes(dense0, BLOCK0)
             blk1 = self.pm.read_bytes(dense1, BLOCK0)
@@ -577,6 +608,7 @@ class War3StatsApp:
             print(f"[行走] DNA 常量不足 ({len(dna)})，块结构差异过大")
             return None
 
+        # 优先指针样常量（唯一性强）；锚点取第一个
         ptr_like = [(o, v) for o, v in dna if 0x10000 < v < 0x7FFFFFFF]
         use_dna = ptr_like[:6] if len(ptr_like) >= 3 else dna[:10]
         anchor_off, anchor_val = use_dna[0]
@@ -594,6 +626,7 @@ class War3StatsApp:
                     return False
             return True
 
+        # ── 连续行走 ────────────────────────────────────────
         SEARCH_LO, SEARCH_HI = 0x1240, 0x1340
         blocks = [dense0, dense1]
         cur = dense1
@@ -632,6 +665,7 @@ class War3StatsApp:
         if len(blocks) < n_active:
             print(f"[行走] 仅找到 {len(blocks)} 块 < 活跃 {n_active}")
 
+        # ── 映射 + 校验 ─────────────────────────────────────
         result = {}
         for i, slot in enumerate(active):
             if i < len(blocks):
