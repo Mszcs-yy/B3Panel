@@ -29,7 +29,7 @@ DISCOVER_FAIL_THRESHOLD = 30
 
 
 # ==============================================================
-# 📊 资源追踪器（纯检测，无硬编码槽位）
+# 📊 资源追踪器（原子化双通道捆绑防呆系统）
 # ==============================================================
 class ResourceTracker:
     def __init__(self, n=NUM_PLAYERS):
@@ -39,16 +39,15 @@ class ResourceTracker:
         self.cum_normal = [0] * n
         self.cum_rare   = [0] * n
         self.cum_food   = [0] * n
-        self._refund_n  = [[] for _ in range(n)]
-        self._refund_r  = [[] for _ in range(n)]
+        
+        # ⭐ 全局捆绑交易池，存放格式：(timestamp, 损失的普通资源, 损失的稀有资源)
+        self._global_refund = []
 
-        # ⭐ 完全无硬编码 - 全部由饱食度检测填充
         self.active_slots   = set()
-        self._sorted_active = []   # 缓存排序结果，避免重复 sort
+        self._sorted_active = []
 
     def mark_food(self, slot_idx: int, food):
         """饱食度偏离默认值且在合法存活区间才标记为活跃；一旦活跃永久保留"""
-        # ⚠️ 防御：拦截 16 万的乱码或负数，防止幽灵槽位激活
         if food is None or food <= 0 or food > 500 or food == DEFAULT_FOOD:
             return
         with self._lock:
@@ -68,13 +67,19 @@ class ResourceTracker:
         with self._lock:
             return len(self.active_slots)
 
-    def _try_match_refund(self, queue: list, amount: int) -> bool:
+    def _try_match_global_bundle(self, gain_n: int, gain_r: int) -> bool:
+        """从全局交易池中寻找严丝合缝的 (普通, 稀有) 捆绑包"""
         now = time.time()
-        while queue and now - queue[0][0] > REFUND_WINDOW_SEC:
-            queue.pop(0)
-        for i in range(len(queue) - 1, -1, -1):
-            if queue[i][1] == amount:
-                queue.pop(i)
+        # 清理超时的滞留账单（超过 5 分钟的未核销损失，视为被系统刷掉）
+        while self._global_refund and now - self._global_refund[0][0] > REFUND_WINDOW_SEC:
+            self._global_refund.pop(0)
+            
+        # 逆序遍历，优先匹配最近发生的掉落/消耗
+        for i in range(len(self._global_refund) - 1, -1, -1):
+            t, loss_n, loss_r = self._global_refund[i]
+            # ⭐ 绝对原子化校验：必须普通和稀有同时完全一致，才视为遗产/退款
+            if loss_n == gain_n and loss_r == gain_r:
+                self._global_refund.pop(i)
                 return True
         return False
 
@@ -85,30 +90,46 @@ class ResourceTracker:
         with self._lock:
             new_n, new_r, new_f = prev_n, prev_r, prev_f
 
-            if normal is not None:
-                if prev_n is not None:
-                    dn = normal - prev_n
-                    if dn < 0:
-                        self._refund_n[idx].append((now, -dn))
-                    elif dn > 0:
-                        if self._try_match_refund(self._refund_n[idx], dn):
-                            pass
-                        elif dn % NORMAL_FILTER != 0:
-                            self.cum_normal[idx] += dn
+            # 提取增量
+            dn = 0
+            if normal is not None and prev_n is not None:
+                dn = normal - prev_n
+                new_n = normal
+            elif normal is not None:
                 new_n = normal
 
-            if rare is not None:
-                if prev_r is not None:
-                    dr = rare - prev_r
-                    if dr < 0:
-                        self._refund_r[idx].append((now, -dr))
-                    elif dr > 0:
-                        if self._try_match_refund(self._refund_r[idx], dr):
-                            pass
-                        elif dr % RARE_FILTER != 0:
-                            self.cum_rare[idx] += dr
+            dr = 0
+            if rare is not None and prev_r is not None:
+                dr = rare - prev_r
+                new_r = rare
+            elif rare is not None:
                 new_r = rare
 
+            # ⭐ 核心并发逻辑：处理资源同时变化
+            if dn != 0 or dr != 0:
+                loss_n = -dn if dn < 0 else 0
+                loss_r = -dr if dr < 0 else 0
+                gain_n = dn if dn > 0 else 0
+                gain_r = dr if dr > 0 else 0
+
+                # 1. 玩家消费、退款、死亡掉落 -> 将包裹扔进天空池
+                if loss_n > 0 or loss_r > 0:
+                    self._global_refund.append((now, loss_n, loss_r))
+
+                # 2. 玩家获得资源 -> 去天空池比对账单
+                if gain_n > 0 or gain_r > 0:
+                    if self._try_match_global_bundle(gain_n, gain_r):
+                        # 账单对冲成功！这是一次遗产拾取或退款，面板不加钱
+                        pass
+                    else:
+                        # 没对上账单，说明是打怪合法收入
+                        # 在货架存取的机制下，利用过滤器拦截整数存取
+                        if gain_n > 0 and (gain_n % NORMAL_FILTER != 0):
+                            self.cum_normal[idx] += gain_n
+                        if gain_r > 0 and (gain_r % RARE_FILTER != 0):
+                            self.cum_rare[idx] += gain_r
+
+            # ---------- 饱食度正常处理 ----------
             if food is not None:
                 if prev_f is not None:
                     df = food - prev_f
@@ -130,8 +151,7 @@ class ResourceTracker:
             self.cum_normal = [0] * self.n
             self.cum_rare   = [0] * self.n
             self.cum_food   = [0] * self.n
-            self._refund_n  = [[] for _ in range(self.n)]
-            self._refund_r  = [[] for _ in range(self.n)]
+            self._global_refund = []
             self.active_slots   = set()
             self._sorted_active = []
 
