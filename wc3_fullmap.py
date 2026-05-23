@@ -26,6 +26,9 @@ DEFAULT_FOOD       = 65   # 空槽位的默认饱食度（用于活跃检测）
 
 # 反查触发阈值（连续失败次数；20Hz 下 30 ≈ 1.5 秒）
 DISCOVER_FAIL_THRESHOLD = 30
+# 损耗系数：简单 100% / 标准 90% / 写实 80% / 噩梦 70%
+# WC3 引擎用 R2I 向下取整，所以拾取入账值会比损失值少
+DIFFICULTY_MULTIPLIERS = [1.00, 0.90, 0.80, 0.70]
 
 
 # ==============================================================
@@ -68,19 +71,35 @@ class ResourceTracker:
             return len(self.active_slots)
 
     def _try_match_global_bundle(self, gain_n: int, gain_r: int) -> bool:
-        """从全局交易池中寻找严丝合缝的 (普通, 稀有) 捆绑包"""
         now = time.time()
-        # 清理超时的滞留账单（超过 5 分钟的未核销损失，视为被系统刷掉）
         while self._global_refund and now - self._global_refund[0][0] > REFUND_WINDOW_SEC:
-            self._global_refund.pop(0)
-            
-        # 逆序遍历，优先匹配最近发生的掉落/消耗
+         self._global_refund.pop(0)
+
         for i in range(len(self._global_refund) - 1, -1, -1):
             t, loss_n, loss_r = self._global_refund[i]
-            # ⭐ 绝对原子化校验：必须普通和稀有同时完全一致，才视为遗产/退款
-            if loss_n == gain_n and loss_r == gain_r:
-                self._global_refund.pop(i)
-                return True
+            for mult in DIFFICULTY_MULTIPLIERS:
+             expected_n = int(loss_n * mult)
+             expected_r = int(loss_r * mult)
+             tol = 0 if mult == 1.0 else 1
+             if not (abs(expected_n - gain_n) <= tol
+                      and abs(expected_r - gain_r) <= tol):
+                continue
+
+            # ⭐ 防误判：单通道损失需要金额够大才认账
+            # 双通道(普通+稀有都有)→ 指纹够独特，直接通过
+            # 单通道(只一边有)→ 该通道金额需 ≥ 阈值，避免误吃打怪小收入
+            both_channels = (loss_n > 0 and loss_r > 0)
+            if not both_channels:
+                # 单通道：损失金额必须显著（比如 ≥ NORMAL_FILTER 或 ≥ 100）
+                significant = (
+                    loss_n >= max(NORMAL_FILTER, 100)
+                    or loss_r >= max(RARE_FILTER, 50)
+                )
+                if not significant:
+                    continue
+
+            self._global_refund.pop(i)
+            return True
         return False
 
     def update(self, idx: int, normal=None, rare=None, food=None):
